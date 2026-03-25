@@ -190,7 +190,6 @@ async def games(call: types.CallbackQuery):
 async def start_game(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(game=call.data)
     await call.message.answer(f"Мин ставка: {MIN_BET}$\\nВведите ставку:")
-Введите ставку:")
     await BetState.amount.set()
 
 @dp.message_handler(state=BetState.amount)
