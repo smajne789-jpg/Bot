@@ -241,11 +241,9 @@ async def play(msg: types.Message, state: FSMContext):
         if result >= 18:
             win = bet * 3
             update_balance(msg.from_user.id, win)
-            await msg.answer(f"{a} × {b} = {result}
-Победа +${win}")
+            await msg.answer(f"{a} x {b} = {result}\nПобеда +${win}")
         else:
-            await msg.answer(f"{a} × {b} = {result}
-Проигрыш")
+            await msg.answer(f"{a} x {b} = {result}\nПроигрыш")
 
     elif game == "whale":
         r=random.randint(1,100)
