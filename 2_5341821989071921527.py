@@ -1,4 +1,4 @@
-# FINAL CASINO BOT (AUTO CRYPTO + LIMITS + CHANNEL WITHDRAW)
+# FINAL CASINO BOT ULTRA (ANTI-ABUSE + ADMIN + PREMIUM EMOJI)
 
 import os
 import random
@@ -6,8 +6,10 @@ import sqlite3
 import string
 import aiohttp
 import asyncio
+import time
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -21,8 +23,10 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 
 MIN_BET = 0.1
 MIN_WITHDRAW = 1.5
+MAX_BET = 100
+BET_COOLDOWN = 3
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot, storage=MemoryStorage())
 
 conn = sqlite3.connect("db.sqlite3")
@@ -31,6 +35,11 @@ cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance REAL DEFAULT 0)")
 cursor.execute("CREATE TABLE IF NOT EXISTS invoices (id INTEGER, user_id INTEGER, amount REAL, status TEXT)")
 conn.commit()
+
+# анти абуз
+user_last_bet = {}
+user_checks_used = {}
+checks = {}
 
 # FSM
 class DepositState(StatesGroup):
@@ -43,7 +52,12 @@ class BetState(StatesGroup):
     amount = State()
     game = State()
 
-# UTILS
+class CheckState(StatesGroup):
+    amount = State()
+    uses = State()
+    min_dep = State()
+
+# utils
 def get_user(uid):
     cursor.execute("SELECT * FROM users WHERE user_id=?", (uid,))
     u = cursor.fetchone()
@@ -56,6 +70,13 @@ def get_user(uid):
 def update_balance(uid, amount):
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
     conn.commit()
+
+def can_bet(uid):
+    now = time.time()
+    if uid in user_last_bet and now - user_last_bet[uid] < BET_COOLDOWN:
+        return False
+    user_last_bet[uid] = now
+    return True
 
 # CRYPTO
 async def create_invoice(amount, uid):
@@ -100,26 +121,62 @@ async def check_invoices():
                             cursor.execute("UPDATE invoices SET status='paid' WHERE id=?", (invoice_id,))
                             conn.commit()
 
-                            try:
-                                await bot.send_message(uid, f"✅ Пополнение +${amount}")
-                            except:
-                                pass
+                            await bot.send_message(uid, f"<emoji id=5210952531676504517>💳</emoji> Пополнение +${amount}")
 
-# MENU
+# MENU (НЕ INLINE)
 def main_menu():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Профиль", callback_data="profile"))
-    kb.add(InlineKeyboardButton("Игры", callback_data="games"))
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("👤 Профиль"), KeyboardButton("🎮 Играть"))
     return kb
 
+# START
+@dp.message_handler(commands=['start'])
+async def start(msg: types.Message):
+    get_user(msg.from_user.id)
+
+    # чек активация
+    if "check_" in msg.text:
+        code = msg.text.split("check_")[1]
+
+        if code in checks:
+            if code not in user_checks_used:
+                user_checks_used[code] = []
+
+            if msg.from_user.id in user_checks_used[code]:
+                return await msg.answer("❌ Уже использовал")
+
+            check = checks[code]
+
+            cursor.execute("SELECT SUM(amount) FROM invoices WHERE user_id=? AND status='paid'", (msg.from_user.id,))
+            total_dep = cursor.fetchone()[0] or 0
+
+            if total_dep < check['min_dep']:
+                return await msg.answer("❌ Недостаточно депозита")
+
+            update_balance(msg.from_user.id, check['amount'])
+            check['uses'] -= 1
+            user_checks_used[code].append(msg.from_user.id)
+
+            await msg.answer(f"🎉 Чек активирован +${check['amount']}")
+
+    await msg.answer(
+        "<emoji id=5409048419211682843>🎰</emoji> Добро пожаловать в PAVLUCK CASINO",
+        reply_markup=main_menu()
+    )
+
 # PROFILE
-@dp.callback_query_handler(lambda c: c.data=="profile")
-async def profile(call: types.CallbackQuery):
-    u = get_user(call.from_user.id)
+@dp.message_handler(lambda m: m.text == "👤 Профиль")
+async def profile(msg: types.Message):
+    u = get_user(msg.from_user.id)
+
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Пополнить", callback_data="dep"))
-    kb.add(InlineKeyboardButton("Вывод", callback_data="wd"))
-    await call.message.edit_text(f"ID:{u[0]}\nБаланс:${u[1]:.2f}", reply_markup=kb)
+    kb.add(InlineKeyboardButton("💳 Пополнить", callback_data="dep"))
+    kb.add(InlineKeyboardButton("💸 Вывод", callback_data="wd"))
+
+    await msg.answer(
+        f"<emoji id=5206607081334906820>👤</emoji> ID: {u[0]}\nБаланс: ${u[1]:.2f}",
+        reply_markup=kb
+    )
 
 # DEPOSIT
 @dp.callback_query_handler(lambda c: c.data=="dep")
@@ -129,19 +186,18 @@ async def dep(call: types.CallbackQuery):
 
 @dp.message_handler(state=DepositState.amount)
 async def dep_amount(msg: types.Message, state: FSMContext):
-    amount = float(msg.text)
-    url = await create_invoice(amount, msg.from_user.id)
+    url = await create_invoice(float(msg.text), msg.from_user.id)
 
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Оплатить", url=url))
 
-    await msg.answer("Оплати счет:", reply_markup=kb)
+    await msg.answer("Оплати:", reply_markup=kb)
     await state.finish()
 
-# WITHDRAW
+# WITHDRAW (канал)
 @dp.callback_query_handler(lambda c: c.data=="wd")
 async def wd(call: types.CallbackQuery):
-    await call.message.answer(f"Мин вывод: {MIN_WITHDRAW}$\nВведите сумму:")
+    await call.message.answer("Введите сумму:")
     await WithdrawState.amount.set()
 
 @dp.message_handler(state=WithdrawState.amount)
@@ -149,118 +205,98 @@ async def wd_amount(msg: types.Message, state: FSMContext):
     amount = float(msg.text)
     user = get_user(msg.from_user.id)
 
-    if amount < MIN_WITHDRAW:
-        return await msg.answer("Слишком мало")
-
-    if user[1] < amount:
-        return await msg.answer("Недостаточно средств")
+    if amount < MIN_WITHDRAW or user[1] < amount:
+        return await msg.answer("❌ Ошибка")
 
     update_balance(msg.from_user.id, -amount)
 
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Подтвердить", callback_data=f"ok_{msg.from_user.id}_{amount}"))
-    kb.add(InlineKeyboardButton("Отклонить", callback_data=f"no_{msg.from_user.id}_{amount}"))
+    kb.add(
+        InlineKeyboardButton("✅ Выплатить", callback_data=f"pay_{msg.from_user.id}_{amount}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"deny_{msg.from_user.id}_{amount}")
+    )
 
-    await bot.send_message(CHANNEL_ID, f"💸 Вывод\nID:{msg.from_user.id}\n${amount}", reply_markup=kb)
-    await msg.answer("Заявка отправлена")
+    await bot.send_message(
+        CHANNEL_ID,
+        f"💸 Заявка\nID:{msg.from_user.id}\n${amount}",
+        reply_markup=kb
+    )
+
+    await msg.answer("⏳ Ожидайте")
     await state.finish()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("ok_"))
-async def ok(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data.startswith("pay_"))
+async def pay(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid, amount = call.data.split("_")
+    await bot.send_message(uid, f"✅ Выплата ${amount}")
     await call.message.edit_text("✅ Выплачено")
 
-@dp.callback_query_handler(lambda c: c.data.startswith("no_"))
-async def no(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data.startswith("deny_"))
+async def deny(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
     _, uid, amount = call.data.split("_")
     update_balance(int(uid), float(amount))
+    await bot.send_message(uid, "❌ Отказ")
     await call.message.edit_text("❌ Отклонено")
 
 # GAMES
-@dp.callback_query_handler(lambda c: c.data=="games")
-async def games(call: types.CallbackQuery):
+@dp.message_handler(lambda m: m.text == "🎮 Играть")
+async def games(msg: types.Message):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Чёт", callback_data="even"))
-    kb.add(InlineKeyboardButton("Нечёт", callback_data="odd"))
-    kb.add(InlineKeyboardButton("Ровно 7", callback_data="seven"))
-    kb.add(InlineKeyboardButton("Произведение 18", callback_data="prod18"))
-    kb.add(InlineKeyboardButton("Кит 🐋", callback_data="whale"))
-    await call.message.edit_text("Игры:", reply_markup=kb)
+    kb.add(InlineKeyboardButton("🎲 Чёт x2", callback_data="even"))
+    kb.add(InlineKeyboardButton("🔥 7 x5", callback_data="seven"))
+    kb.add(InlineKeyboardButton("💎 x3", callback_data="prod18"))
+    kb.add(InlineKeyboardButton("🐋 x100", callback_data="whale"))
 
-@dp.callback_query_handler(lambda c: c.data in ["even","odd","seven","whale","prod18"])
+    await msg.answer("<emoji id=5271604874419647061>🎮</emoji> Игры:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data in ["even","seven","prod18","whale"])
 async def start_game(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(game=call.data)
-    await call.message.answer(f"Мин ставка: {MIN_BET}$\nВведите ставку:")
+    await call.message.answer("Ставка:")
     await BetState.amount.set()
 
 @dp.message_handler(state=BetState.amount)
 async def play(msg: types.Message, state: FSMContext):
+    if not can_bet(msg.from_user.id):
+        return await msg.answer("⏳ Подожди")
+
     data = await state.get_data()
     game = data['game']
     bet = float(msg.text)
 
+    if bet < MIN_BET or bet > MAX_BET:
+        return await msg.answer("❌ Лимит")
+
     user = get_user(msg.from_user.id)
-
-    if bet < MIN_BET:
-        return await msg.answer("Ставка слишком маленькая")
-
     if user[1] < bet:
-        return await msg.answer("Недостаточно средств")
+        return await msg.answer("❌ Нет средств")
 
     update_balance(msg.from_user.id, -bet)
 
-    if game == "even":
-        r=random.randint(1,6)
-        if r%2==0:
-            win=bet*2
-            update_balance(msg.from_user.id, win)
-            await msg.answer(f"{r} Победа +${win}")
-        else:
-            await msg.answer(f"{r} Проигрыш")
+    r = random.randint(1,6)
 
-    elif game == "odd":
-        r=random.randint(1,6)
-        if r%2==1:
-            win=bet*2
-            update_balance(msg.from_user.id, win)
-            await msg.answer(f"{r} Победа +${win}")
-        else:
-            await msg.answer(f"{r} Проигрыш")
-
+    if game == "even" and r%2==0:
+        win = bet*2
     elif game == "seven":
-        a,b=random.randint(1,6),random.randint(1,6)
-        if a+b==7:
-            win=bet*5
-            update_balance(msg.from_user.id, win)
-            await msg.answer(f"{a}+{b}=7 +${win}")
-        else:
-            await msg.answer(f"{a}+{b} Проигрыш")
-
+        win = bet*5 if random.randint(1,6)+random.randint(1,6)==7 else 0
     elif game == "prod18":
-        a,b=random.randint(1,6),random.randint(1,6)
-        result = a * b
-        if result >= 18:
-            win = bet * 3
-            update_balance(msg.from_user.id, win)
-            await msg.answer(f"{a} x {b} = {result}\nПобеда +${win}")
-        else:
-            await msg.answer(f"{a} x {b} = {result}\nПроигрыш")
-
+        win = bet*3 if random.randint(1,6)*random.randint(1,6)>=18 else 0
     elif game == "whale":
-        r=random.randint(1,100)
-        if r==100:
-            win=bet*100
-            update_balance(msg.from_user.id, win)
-            await msg.answer(f"🐋 JACKPOT +${win}")
-        else:
-            await msg.answer(f"{r} Проигрыш")
+        win = bet*100 if random.randint(1,100)==100 else 0
+    else:
+        win = 0
+
+    if win > 0:
+        update_balance(msg.from_user.id, win)
+        await msg.answer(f"<emoji id=5224607267797606837>💎</emoji> +${win}")
+    else:
+        await msg.answer("❌ Проигрыш")
 
     await state.finish()
-
-# START
-@dp.message_handler(commands=['start'])
-async def start(msg: types.Message):
-    get_user(msg.from_user.id)
-    await msg.answer("🎰 Казино запущено", reply_markup=main_menu())
 
 # RUN
 if __name__ == '__main__':
